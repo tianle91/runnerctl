@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+#
+# runnerctl — start / stop / check self-hosted GitHub Actions runners across
+# every repo under a directory.
+#
+# It scans a directory for runner installs (<repo>/actions-runner/run.sh) and
+# manages them as a group. Each runner is launched in the background via nohup
+# so they keep listening after this script (and the terminal) exits. Logs and
+# PIDs are written next to each runner. Starting is re-run safe: a runner that's
+# already listening is skipped.
+#
+# Usage:
+#   runnerctl [-d DIR] start     # start all runners under DIR
+#   runnerctl [-d DIR] status    # show which runners are up
+#   runnerctl [-d DIR] stop      # stop runners that are up
+#
+#   -d DIR   directory to scan for runners (default: current directory)
+#
+# Examples:
+#   runnerctl start                 # scan the current directory
+#   runnerctl -d ~/Github status    # scan a specific directory
+
+set -euo pipefail
+
+ROOT="$PWD"
+
+usage() {
+  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+# Parse a leading -d/--dir option (before or after the command).
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d|--dir) ROOT="${2:-}"; shift 2 ;;
+    -h|--help) usage 0 ;;
+    -*) echo "runnerctl: unknown option '$1'" >&2; usage 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+set -- "${args[@]:-}"
+
+if [ ! -d "$ROOT" ]; then
+  echo "runnerctl: not a directory: $ROOT" >&2
+  exit 2
+fi
+ROOT="$(cd "$ROOT" && pwd)"
+
+# Find all runner install dirs (those containing run.sh), sorted for stable order.
+find_runners() {
+  find "$ROOT" -maxdepth 3 -type f -name run.sh -path '*/actions-runner/*' \
+    2>/dev/null | sort
+}
+
+# Is the runner installed at dir $1 already listening? Match the Runner.Listener
+# process by its absolute working-directory path, so runners in different repos
+# never collide.
+is_running() {
+  pgrep -f "$1/bin/Runner.Listener" >/dev/null 2>&1
+}
+
+repo_of() { basename "$(dirname "$1")"; }  # <repo>/actions-runner -> <repo>
+
+start_all() {
+  local any=0
+  while IFS= read -r run_sh; do
+    [ -n "$run_sh" ] || continue
+    any=1
+    local dir repo
+    dir="$(dirname "$run_sh")"
+    repo="$(repo_of "$dir")"
+
+    if is_running "$dir"; then
+      echo "• $repo: already running — skipping"
+      continue
+    fi
+
+    # nohup + background so the runner outlives this shell; log for debugging.
+    (cd "$dir" && nohup ./run.sh >"runner.log" 2>&1 &
+      echo $! >"runner.pid")
+    echo "✓ $repo: started (pid $(cat "$dir/runner.pid"), log: $dir/runner.log)"
+  done < <(find_runners)
+  [ "$any" = 1 ] || echo "No runners found under $ROOT"
+}
+
+status_all() {
+  local any=0
+  while IFS= read -r run_sh; do
+    [ -n "$run_sh" ] || continue
+    any=1
+    local dir repo
+    dir="$(dirname "$run_sh")"
+    repo="$(repo_of "$dir")"
+    if is_running "$dir"; then
+      echo "● $repo: running"
+    else
+      echo "○ $repo: stopped"
+    fi
+  done < <(find_runners)
+  [ "$any" = 1 ] || echo "No runners found under $ROOT"
+}
+
+stop_all() {
+  local any=0
+  while IFS= read -r run_sh; do
+    [ -n "$run_sh" ] || continue
+    any=1
+    local dir repo
+    dir="$(dirname "$run_sh")"
+    repo="$(repo_of "$dir")"
+    if is_running "$dir"; then
+      # Interrupt the listener politely so it deregisters the job cleanly.
+      pkill -INT -f "$dir/bin/Runner.Listener" && echo "✗ $repo: stopped"
+    else
+      echo "○ $repo: not running"
+    fi
+  done < <(find_runners)
+  [ "$any" = 1 ] || echo "No runners found under $ROOT"
+}
+
+case "${1:-}" in
+  start)  start_all ;;
+  status) status_all ;;
+  stop)   stop_all ;;
+  ""|help) usage 0 ;;
+  *) echo "runnerctl: unknown command '$1'" >&2; usage 2 ;;
+esac

@@ -1,0 +1,5 @@
+# Runner artifacts (written next to each runner, never in this repo — listed
+# defensively in case someone runs runnerctl from a checkout).
+runner.log
+runner.pid
+.DS_Store
