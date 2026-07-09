@@ -105,11 +105,19 @@ start_all() {
 
     # nohup + background so the runner outlives this shell; log for debugging.
     # $pre (unquoted) lowers scheduling priority when niceness is enabled.
+    #
+    # Keep this a *foreground* ( ) subshell backgrounding the whole `cd && nohup`
+    # compound — NOT a $(...) command substitution. Backgrounding a simple
+    # command (or running it inside $(...)) makes bash set SIGINT to SIG_IGN on
+    # the child, which the runner inherits and can no longer be interrupted, so
+    # `stop`'s SIGINT would never take and every runner would be force-killed.
+    # runner.pid is written by absolute path so it lands next to the runner
+    # regardless of our cwd (the cd only takes effect in the backgrounded child).
     local pre
     pre="$(nice_prefix)"
     (cd "$dir" && nohup $pre ./run.sh >"runner.log" 2>&1 &
-      echo $! >"runner.pid")
-    echo "✓ $repo: started (pid $(cat "$dir/runner.pid"), log: $dir/runner.log)"
+      echo $! >"$dir/runner.pid")
+    echo "✓ $repo: started (pid $(cat "$dir/runner.pid" 2>/dev/null), log: $dir/runner.log)"
   done < <(find_runners)
   [ "$any" = 1 ] || echo "No runners found under $ROOT"
 }
@@ -146,10 +154,14 @@ stop_all() {
     repo="$(repo_of "$dir")"
     dirs+=("$dir"); repos+=("$repo")
     if is_running "$dir"; then
-      # Interrupt the listener politely so it deregisters the job cleanly.
+      # Interrupt the listener politely so it deregisters the job cleanly, and
+      # confirm right away which runners we're stopping — the outcome (stopped /
+      # force-killed) is reported below once they actually exit.
       pkill -INT -f "$dir/bin/Runner.Listener"
+      echo "→ $repo: stopping…"
       state+=("signalled")
     else
+      echo "○ $repo: not running"
       state+=("not-running")
     fi
   done < <(find_runners)
@@ -183,10 +195,10 @@ stop_all() {
     fi
   done
 
-  # Report in scan order.
+  # Report the outcome for each signalled runner, in scan order. (Runners that
+  # weren't running were already reported above.)
   for i in "${!dirs[@]}"; do
     case "${state[$i]}" in
-      not-running)  echo "○ ${repos[$i]}: not running" ;;
       stopped)      echo "✗ ${repos[$i]}: stopped" ;;
       force-killed) echo "✗ ${repos[$i]}: force-killed (didn't stop gracefully within 10s)" ;;
     esac
