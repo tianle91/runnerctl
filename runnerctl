@@ -14,7 +14,9 @@
 #   runnerctl [-d DIR] status    # show which runners are up
 #   runnerctl [-d DIR] stop      # stop runners that are up
 #
-#   -d DIR   directory to scan for runners (default: current directory)
+#   -d DIR      directory to scan for runners (default: current directory)
+#   --no-nice   don't lower runner priority (by default runners start at the
+#               lowest CPU/I/O priority so they never starve foreground work)
 #
 # Examples:
 #   runnerctl start                 # scan the current directory
@@ -23,9 +25,13 @@
 set -euo pipefail
 
 ROOT="$PWD"
+NICE=1  # lower runner priority by default; disable with --no-nice
+# Seconds to wait for a runner to shut down gracefully on `stop` before we
+# escalate to SIGKILL. Overridable (mainly for tests) via the environment.
+STOP_GRACE_SECS="${RUNNERCTL_STOP_GRACE:-10}"
 
 usage() {
-  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -34,6 +40,8 @@ args=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -d|--dir) ROOT="${2:-}"; shift 2 ;;
+    --nice) NICE=1; shift ;;
+    --no-nice) NICE=0; shift ;;
     -h|--help) usage 0 ;;
     -*) echo "runnerctl: unknown option '$1'" >&2; usage 2 ;;
     *) args+=("$1"); shift ;;
@@ -62,6 +70,28 @@ is_running() {
 
 repo_of() { basename "$(dirname "$1")"; }  # <repo>/actions-runner -> <repo>
 
+# Echo a command prefix that runs the runner at the lowest scheduling priority,
+# so it yields CPU/I/O to foreground work. Empty when niceness is disabled.
+#   Linux : nice -n 19  (max niceness) + ionice -c 3 (idle I/O class)
+#   macOS : taskpolicy -b  (background tier — throttles both CPU and I/O),
+#           falling back to nice, since macOS has no ionice.
+nice_prefix() {
+  [ "$NICE" = 1 ] || return 0
+  if [ "$(uname)" = "Darwin" ]; then
+    if command -v taskpolicy >/dev/null 2>&1; then
+      echo "taskpolicy -b"
+    else
+      echo "nice -n 20"
+    fi
+    return 0
+  fi
+  if command -v ionice >/dev/null 2>&1; then
+    echo "nice -n 19 ionice -c 3"
+  else
+    echo "nice -n 19"
+  fi
+}
+
 start_all() {
   local any=0
   while IFS= read -r run_sh; do
@@ -77,9 +107,26 @@ start_all() {
     fi
 
     # nohup + background so the runner outlives this shell; log for debugging.
-    (cd "$dir" && nohup ./run.sh >"runner.log" 2>&1 &
-      echo $! >"runner.pid")
-    echo "✓ $repo: started (pid $(cat "$dir/runner.pid"), log: $dir/runner.log)"
+    # $pre (unquoted) lowers scheduling priority when niceness is enabled.
+    #
+    # Keep this a *foreground* ( ) subshell backgrounding the whole `cd && nohup`
+    # compound — NOT a $(...) command substitution. Backgrounding a simple
+    # command (or running it inside $(...)) makes bash set SIGINT to SIG_IGN on
+    # the child, which the runner inherits and can no longer be interrupted, so
+    # `stop`'s SIGINT would never take and every runner would be force-killed.
+    # runner.pid is written by absolute path so it lands next to the runner
+    # regardless of our cwd (the cd only takes effect in the backgrounded child).
+    #
+    # The launcher subshell's std streams are pointed at /dev/null so the
+    # backgrounded supervisor never holds our caller's stdout — otherwise
+    # `runnerctl start | …` (or any captured output) would hang until every
+    # runner exits. The runner's own output still goes to runner.log.
+    local pre
+    pre="$(nice_prefix)"
+    # shellcheck disable=SC2086  # $pre must word-split into the nice/ionice prefix
+    (cd "$dir" && nohup $pre ./run.sh >"runner.log" 2>&1 &
+      echo $! >"$dir/runner.pid") >/dev/null 2>&1 </dev/null
+    echo "✓ $repo: started (pid $(cat "$dir/runner.pid" 2>/dev/null), log: $dir/runner.log)"
   done < <(find_runners)
   [ "$any" = 1 ] || echo "No runners found under $ROOT"
 }
@@ -103,20 +150,68 @@ status_all() {
 
 stop_all() {
   local any=0
+  local -a dirs=() repos=() state=()
+
+  # Pass 1: SIGINT every running runner up front (don't wait yet). SIGINT
+  # triggers a *graceful* shutdown that takes a few seconds, so signalling all
+  # of them first lets their shutdowns overlap instead of serialising.
   while IFS= read -r run_sh; do
     [ -n "$run_sh" ] || continue
     any=1
     local dir repo
     dir="$(dirname "$run_sh")"
     repo="$(repo_of "$dir")"
+    dirs+=("$dir"); repos+=("$repo")
     if is_running "$dir"; then
-      # Interrupt the listener politely so it deregisters the job cleanly.
-      pkill -INT -f "$dir/bin/Runner.Listener" && echo "✗ $repo: stopped"
+      # Interrupt the listener politely so it deregisters the job cleanly, and
+      # confirm right away which runners we're stopping — the outcome (stopped /
+      # force-killed) is reported below once they actually exit.
+      pkill -INT -f "$dir/bin/Runner.Listener"
+      echo "→ $repo: stopping…"
+      state+=("signalled")
     else
       echo "○ $repo: not running"
+      state+=("not-running")
     fi
   done < <(find_runners)
-  [ "$any" = 1 ] || echo "No runners found under $ROOT"
+  [ "$any" = 1 ] || { echo "No runners found under $ROOT"; return; }
+
+  # Pass 2: wait for the signalled runners to actually exit, sharing one grace
+  # window across all of them (rather than reporting success the instant the
+  # signal is delivered — otherwise a follow-up `start` sees a still-dying
+  # process and skips it as "already running").
+  local waited=0 i still deadline=$((STOP_GRACE_SECS * 10))
+  while [ "$waited" -lt "$deadline" ]; do  # shared window, not per runner
+    still=0
+    for i in "${!dirs[@]}"; do
+      [ "${state[$i]}" = signalled ] || continue
+      if is_running "${dirs[$i]}"; then
+        still=1
+      else
+        state[i]=stopped
+      fi
+    done
+    [ "$still" = 1 ] || break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  # Pass 3: force-kill anything still alive after the grace period.
+  for i in "${!dirs[@]}"; do
+    if [ "${state[$i]}" = signalled ]; then
+      pkill -KILL -f "${dirs[$i]}/bin/Runner.Listener"
+      state[i]=force-killed
+    fi
+  done
+
+  # Report the outcome for each signalled runner, in scan order. (Runners that
+  # weren't running were already reported above.)
+  for i in "${!dirs[@]}"; do
+    case "${state[$i]}" in
+      stopped)      echo "✗ ${repos[$i]}: stopped" ;;
+      force-killed) echo "✗ ${repos[$i]}: force-killed (didn't stop gracefully within ${STOP_GRACE_SECS}s)" ;;
+    esac
+  done
 }
 
 case "${1:-}" in

@@ -1,0 +1,26 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        continue-on-error: true  # advisory; the test suite below is the gate
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck runnerctl test/runnerctl.test.sh
+          else
+            echo "shellcheck not available on this runner — skipping"
+          fi
+      - name: run tests
+        run: ./test/runnerctl.test.sh
