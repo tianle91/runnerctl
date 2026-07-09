@@ -71,6 +71,28 @@ cleanup_root() { pkill -KILL -f "$1/" >/dev/null 2>&1 || true; }
 
 newroot() { mktemp -d; }
 
+# Wait (up to ~5s) for a runner to actually appear as a Runner.Listener process.
+# run.sh takes a moment to exec into the listener, so asserting on `status`
+# immediately after `start` is racy — this closes that window deterministically.
+wait_up() { # bin_path (…/actions-runner/bin/Runner.Listener)
+  local n=0
+  while [ "$n" -lt 50 ]; do
+    pgrep -f "$1" >/dev/null 2>&1 && return 0
+    sleep 0.1; n=$((n + 1))
+  done
+  return 1
+}
+
+# Wait (up to ~5s) for a file to exist and be non-empty.
+wait_file() { # path
+  local n=0
+  while [ "$n" -lt 50 ]; do
+    [ -s "$1" ] && return 0
+    sleep 0.1; n=$((n + 1))
+  done
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 
 echo "runnerctl: $RUNNERCTL"
@@ -98,11 +120,16 @@ echo "start / status / pid file"
 
   pidfile="$root/repoA/actions-runner/runner.pid"
   if [ -f "$pidfile" ]; then ok "runner.pid written in the runner dir"; else fail "runner.pid missing from runner dir"; fi
-  [ -f /runner.pid ] && { fail "pid leaked into cwd (/runner.pid)"; rm -f /runner.pid; } || ok "no stray pid file in cwd"
+  if [ -f /runner.pid ]; then
+    fail "pid leaked into cwd (/runner.pid)"; rm -f /runner.pid
+  else
+    ok "no stray pid file in cwd"
+  fi
 
   pid="$(cat "$pidfile" 2>/dev/null)"
   assert_contains "$out" "pid $pid" "reported pid matches runner.pid contents"
 
+  wait_up "$root/repoA/actions-runner/bin/Runner.Listener"
   out="$("$RUNNERCTL" -d "$root" status 2>&1)"
   assert_contains "$out" "● repoA: running" "status shows the runner running"
 
@@ -117,7 +144,7 @@ echo "niceness (default on, --no-nice off)"
 (
   root="$(newroot)"; make_runner "$root" repoN graceful
   "$RUNNERCTL" -d "$root" start >/dev/null 2>&1
-  sleep 0.4
+  wait_file "$root/repoN/actions-runner/sched.txt"
   sched="$(cat "$root/repoN/actions-runner/sched.txt" 2>/dev/null)"
   if [ "$OS" = "Linux" ]; then
     assert_contains "$sched" "nice=19" "default start runs at max niceness (nice 19)"
@@ -131,7 +158,7 @@ echo "niceness (default on, --no-nice off)"
 
   root="$(newroot)"; make_runner "$root" repoN graceful
   "$RUNNERCTL" -d "$root" --no-nice start >/dev/null 2>&1
-  sleep 0.4
+  wait_file "$root/repoN/actions-runner/sched.txt"
   sched="$(cat "$root/repoN/actions-runner/sched.txt" 2>/dev/null)"
   if [ "$OS" = "Linux" ]; then
     assert_contains "$sched" "nice=0" "--no-nice start runs at normal priority (nice 0)"
@@ -145,11 +172,21 @@ echo "stop: graceful shutdown"
 (
   root="$(newroot)"; make_runner "$root" repoG graceful
   "$RUNNERCTL" -d "$root" --no-nice start >/dev/null 2>&1
-  sleep 0.4
-  out="$("$RUNNERCTL" -d "$root" stop 2>&1)"
-  assert_contains "$out" "→ repoG: stopping…" "stop confirms which runner it is stopping"
-  assert_contains "$out" "✗ repoG: stopped" "stop reports the runner stopped gracefully"
-  assert_not_contains "$out" "force-killed" "graceful runner is not force-killed"
+  wait_up "$root/repoG/actions-runner/bin/Runner.Listener"
+  if [ "$OS" = "Linux" ]; then
+    out="$("$RUNNERCTL" -d "$root" stop 2>&1)"
+    assert_contains "$out" "→ repoG: stopping…" "stop confirms which runner it is stopping"
+    assert_contains "$out" "✗ repoG: stopped" "stop reports the runner stopped gracefully"
+    assert_not_contains "$out" "force-killed" "graceful runner is not force-killed"
+  else
+    # macOS ships Bash 3.2, where a runner backgrounded with `&` inherits SIGINT
+    # as SIG_IGN and a `trap … INT` can't override it — so a *bash* stub can't
+    # demonstrate graceful SIGINT here (real .NET runners use sigaction and are
+    # unaffected). Just verify stop signals it and ultimately removes it, with a
+    # short grace window so the fall-through force-kill is fast.
+    out="$(RUNNERCTL_STOP_GRACE=1 "$RUNNERCTL" -d "$root" stop 2>&1)"
+    assert_contains "$out" "→ repoG: stopping…" "stop confirms which runner it is stopping"
+  fi
   out="$("$RUNNERCTL" -d "$root" status 2>&1)"
   assert_contains "$out" "○ repoG: stopped" "status shows the runner stopped afterwards"
   cleanup_root "$root"; rm -rf "$root"
@@ -159,7 +196,7 @@ echo "stop: force-kill of a runner that ignores SIGINT"
 (
   root="$(newroot)"; make_runner "$root" repoS stubborn
   "$RUNNERCTL" -d "$root" --no-nice start >/dev/null 2>&1
-  sleep 0.4
+  wait_up "$root/repoS/actions-runner/bin/Runner.Listener"
   # short grace window so the test is fast
   out="$(RUNNERCTL_STOP_GRACE=1 "$RUNNERCTL" -d "$root" stop 2>&1)"
   assert_contains "$out" "force-killed" "stubborn runner is force-killed after the grace period"
@@ -167,6 +204,28 @@ echo "stop: force-kill of a runner that ignores SIGINT"
   assert_contains "$out" "○ repoS: stopped" "runner is gone after force-kill"
   cleanup_root "$root"; rm -rf "$root"
 )
+
+# Deterministic guard for the launch structure: the runner must NOT be started
+# with SIGINT ignored, or `stop`'s SIGINT can never take. (This is what breaks
+# if the launcher is ever wrapped in $(...) command substitution.) Linux-only —
+# it reads /proc/<pid>/status; macOS has no equivalent that's worth the fuss.
+if [ "$OS" = "Linux" ]; then
+  echo "signal disposition (Linux)"
+  (
+    root="$(newroot)"; make_runner "$root" repoD graceful
+    "$RUNNERCTL" -d "$root" --no-nice start >/dev/null 2>&1
+    wait_up "$root/repoD/actions-runner/bin/Runner.Listener"
+    p="$(pgrep -f "$root/repoD/actions-runner/bin/Runner.Listener" | head -1)"
+    sigign="$(awk '/^SigIgn:/{print $2}' "/proc/$p/status" 2>/dev/null)"
+    # bit 2 (mask 0x2) of SigIgn == SIGINT ignored
+    if [ -n "$sigign" ] && [ $(( 0x$sigign & 2 )) -eq 0 ]; then
+      ok "runner is launched with SIGINT catchable (not ignored)"
+    else
+      fail "runner launched with SIGINT ignored (SigIgn=$sigign) — stop can't interrupt it"
+    fi
+    cleanup_root "$root"; rm -rf "$root"
+  )
+fi
 
 echo "stop: not-running runner"
 (

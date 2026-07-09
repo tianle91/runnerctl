@@ -188,7 +188,7 @@ stop_all() {
       if is_running "${dirs[$i]}"; then
         still=1
       else
-        state[$i]=stopped
+        state[i]=stopped
       fi
     done
     [ "$still" = 1 ] || break
@@ -200,7 +200,7 @@ stop_all() {
   for i in "${!dirs[@]}"; do
     if [ "${state[$i]}" = signalled ]; then
       pkill -KILL -f "${dirs[$i]}/bin/Runner.Listener"
-      state[$i]=force-killed
+      state[i]=force-killed
     fi
   done
 
