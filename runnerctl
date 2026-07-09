@@ -141,7 +141,23 @@ stop_all() {
     repo="$(repo_of "$dir")"
     if is_running "$dir"; then
       # Interrupt the listener politely so it deregisters the job cleanly.
-      pkill -INT -f "$dir/bin/Runner.Listener" && echo "✗ $repo: stopped"
+      # SIGINT triggers a *graceful* shutdown that takes a few seconds, so wait
+      # for the process to actually exit (rather than reporting success the
+      # instant the signal is delivered) — otherwise a follow-up `start` sees
+      # the still-dying process and skips it as "already running".
+      pkill -INT -f "$dir/bin/Runner.Listener"
+      local waited=0
+      while is_running "$dir" && [ "$waited" -lt 100 ]; do  # up to ~10s
+        sleep 0.1
+        waited=$((waited + 1))
+      done
+      if is_running "$dir"; then
+        # Didn't stop gracefully within the grace period — force it.
+        pkill -KILL -f "$dir/bin/Runner.Listener"
+        echo "✗ $repo: force-killed (didn't stop gracefully within 10s)"
+      else
+        echo "✗ $repo: stopped"
+      fi
     else
       echo "○ $repo: not running"
     fi
