@@ -16,6 +16,10 @@ building iOS/macOS apps) and want to bring the whole fleet up or down at once.
   listening after the terminal closes. A `runner.log` and `runner.pid` are
   written next to each runner. Starting is re-run safe: a runner that's already
   listening is skipped (matched by its absolute path, so repos never collide).
+  By default runners start at the **lowest scheduling priority** so a busy CI
+  job never starves your foreground work — on Linux that's `nice -n 19` plus the
+  idle I/O class (`ionice -c 3`); on macOS it's `taskpolicy -b`, which throttles
+  both CPU and I/O. Pass `--no-nice` to run them at normal priority instead.
 - **status** reports which runners are up.
 - **stop** sends `SIGINT` to each running listener so it deregisters cleanly.
 
@@ -30,8 +34,9 @@ Commands:
   stop      stop runners that are up
 
 Options:
-  -d DIR    directory to scan for runners (default: current directory)
-  -h        show help
+  -d DIR     directory to scan for runners (default: current directory)
+  --no-nice  run runners at normal priority (default: lowest CPU/I/O priority)
+  -h         show help
 ```
 
 ### Examples

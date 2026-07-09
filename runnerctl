@@ -14,7 +14,9 @@
 #   runnerctl [-d DIR] status    # show which runners are up
 #   runnerctl [-d DIR] stop      # stop runners that are up
 #
-#   -d DIR   directory to scan for runners (default: current directory)
+#   -d DIR      directory to scan for runners (default: current directory)
+#   --no-nice   don't lower runner priority (by default runners start at the
+#               lowest CPU/I/O priority so they never starve foreground work)
 #
 # Examples:
 #   runnerctl start                 # scan the current directory
@@ -23,9 +25,10 @@
 set -euo pipefail
 
 ROOT="$PWD"
+NICE=1  # lower runner priority by default; disable with --no-nice
 
 usage() {
-  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -34,6 +37,8 @@ args=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -d|--dir) ROOT="${2:-}"; shift 2 ;;
+    --nice) NICE=1; shift ;;
+    --no-nice) NICE=0; shift ;;
     -h|--help) usage 0 ;;
     -*) echo "runnerctl: unknown option '$1'" >&2; usage 2 ;;
     *) args+=("$1"); shift ;;
@@ -62,6 +67,28 @@ is_running() {
 
 repo_of() { basename "$(dirname "$1")"; }  # <repo>/actions-runner -> <repo>
 
+# Echo a command prefix that runs the runner at the lowest scheduling priority,
+# so it yields CPU/I/O to foreground work. Empty when niceness is disabled.
+#   Linux : nice -n 19  (max niceness) + ionice -c 3 (idle I/O class)
+#   macOS : taskpolicy -b  (background tier — throttles both CPU and I/O),
+#           falling back to nice, since macOS has no ionice.
+nice_prefix() {
+  [ "$NICE" = 1 ] || return 0
+  if [ "$(uname)" = "Darwin" ]; then
+    if command -v taskpolicy >/dev/null 2>&1; then
+      echo "taskpolicy -b"
+    else
+      echo "nice -n 20"
+    fi
+    return 0
+  fi
+  if command -v ionice >/dev/null 2>&1; then
+    echo "nice -n 19 ionice -c 3"
+  else
+    echo "nice -n 19"
+  fi
+}
+
 start_all() {
   local any=0
   while IFS= read -r run_sh; do
@@ -77,7 +104,10 @@ start_all() {
     fi
 
     # nohup + background so the runner outlives this shell; log for debugging.
-    (cd "$dir" && nohup ./run.sh >"runner.log" 2>&1 &
+    # $pre (unquoted) lowers scheduling priority when niceness is enabled.
+    local pre
+    pre="$(nice_prefix)"
+    (cd "$dir" && nohup $pre ./run.sh >"runner.log" 2>&1 &
       echo $! >"runner.pid")
     echo "✓ $repo: started (pid $(cat "$dir/runner.pid"), log: $dir/runner.log)"
   done < <(find_runners)
