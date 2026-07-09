@@ -133,36 +133,64 @@ status_all() {
 
 stop_all() {
   local any=0
+  local -a dirs=() repos=() state=()
+
+  # Pass 1: SIGINT every running runner up front (don't wait yet). SIGINT
+  # triggers a *graceful* shutdown that takes a few seconds, so signalling all
+  # of them first lets their shutdowns overlap instead of serialising.
   while IFS= read -r run_sh; do
     [ -n "$run_sh" ] || continue
     any=1
     local dir repo
     dir="$(dirname "$run_sh")"
     repo="$(repo_of "$dir")"
+    dirs+=("$dir"); repos+=("$repo")
     if is_running "$dir"; then
       # Interrupt the listener politely so it deregisters the job cleanly.
-      # SIGINT triggers a *graceful* shutdown that takes a few seconds, so wait
-      # for the process to actually exit (rather than reporting success the
-      # instant the signal is delivered) — otherwise a follow-up `start` sees
-      # the still-dying process and skips it as "already running".
       pkill -INT -f "$dir/bin/Runner.Listener"
-      local waited=0
-      while is_running "$dir" && [ "$waited" -lt 100 ]; do  # up to ~10s
-        sleep 0.1
-        waited=$((waited + 1))
-      done
-      if is_running "$dir"; then
-        # Didn't stop gracefully within the grace period — force it.
-        pkill -KILL -f "$dir/bin/Runner.Listener"
-        echo "✗ $repo: force-killed (didn't stop gracefully within 10s)"
-      else
-        echo "✗ $repo: stopped"
-      fi
+      state+=("signalled")
     else
-      echo "○ $repo: not running"
+      state+=("not-running")
     fi
   done < <(find_runners)
-  [ "$any" = 1 ] || echo "No runners found under $ROOT"
+  [ "$any" = 1 ] || { echo "No runners found under $ROOT"; return; }
+
+  # Pass 2: wait for the signalled runners to actually exit, sharing one ~10s
+  # window across all of them (rather than reporting success the instant the
+  # signal is delivered — otherwise a follow-up `start` sees a still-dying
+  # process and skips it as "already running").
+  local waited=0 i still
+  while [ "$waited" -lt 100 ]; do  # up to ~10s total, not per runner
+    still=0
+    for i in "${!dirs[@]}"; do
+      [ "${state[$i]}" = signalled ] || continue
+      if is_running "${dirs[$i]}"; then
+        still=1
+      else
+        state[$i]=stopped
+      fi
+    done
+    [ "$still" = 1 ] || break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  # Pass 3: force-kill anything still alive after the grace period.
+  for i in "${!dirs[@]}"; do
+    if [ "${state[$i]}" = signalled ]; then
+      pkill -KILL -f "${dirs[$i]}/bin/Runner.Listener"
+      state[$i]=force-killed
+    fi
+  done
+
+  # Report in scan order.
+  for i in "${!dirs[@]}"; do
+    case "${state[$i]}" in
+      not-running)  echo "○ ${repos[$i]}: not running" ;;
+      stopped)      echo "✗ ${repos[$i]}: stopped" ;;
+      force-killed) echo "✗ ${repos[$i]}: force-killed (didn't stop gracefully within 10s)" ;;
+    esac
+  done
 }
 
 case "${1:-}" in
