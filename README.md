@@ -21,7 +21,11 @@ building iOS/macOS apps) and want to bring the whole fleet up or down at once.
   idle I/O class (`ionice -c 3`); on macOS it's `taskpolicy -b`, which throttles
   both CPU and I/O. Pass `--no-nice` to run them at normal priority instead.
 - **status** reports which runners are up.
-- **stop** sends `SIGINT` to each running listener so it deregisters cleanly.
+- **stop** sends `SIGINT` to each running listener so it deregisters cleanly,
+  then waits for it to actually exit before reporting `stopped`. Runners are
+  signalled all at once and share a single grace window (10s by default; set
+  `RUNNERCTL_STOP_GRACE` to change it). Any runner that hasn't exited by then is
+  force-killed with `SIGKILL`.
 
 ## Usage
 
@@ -57,8 +61,9 @@ git clone https://github.com/tianle91/runnerctl.git
 ln -s "$PWD/runnerctl/runnerctl" /usr/local/bin/runnerctl
 ```
 
-Requires Bash and standard Unix tools (`find`, `pgrep`, `pkill`, `nohup`) —
-present by default on macOS and Linux.
+Requires Bash and standard Unix tools (`find`, `pgrep`, `pkill`, `nohup`, and
+`nice`/`ionice` on Linux or `taskpolicy` on macOS) — present by default on
+macOS and Linux.
 
 ## Caveats
 
@@ -69,6 +74,17 @@ present by default on macOS and Linux.
   up) re-running `start` is a no-op.
 - It manages runners that are **already installed and configured**
   (`config.sh` has been run). It does not register new runners.
+
+## Development
+
+Run the test suite (dependency-free Bash):
+
+```sh
+./test/runnerctl.test.sh
+```
+
+See [AGENTS.md](AGENTS.md) for the architecture and the subtle shell behaviours
+the launcher depends on.
 
 ## License
 

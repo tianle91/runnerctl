@@ -26,6 +26,9 @@ set -euo pipefail
 
 ROOT="$PWD"
 NICE=1  # lower runner priority by default; disable with --no-nice
+# Seconds to wait for a runner to shut down gracefully on `stop` before we
+# escalate to SIGKILL. Overridable (mainly for tests) via the environment.
+STOP_GRACE_SECS="${RUNNERCTL_STOP_GRACE:-10}"
 
 usage() {
   sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
@@ -113,10 +116,16 @@ start_all() {
     # `stop`'s SIGINT would never take and every runner would be force-killed.
     # runner.pid is written by absolute path so it lands next to the runner
     # regardless of our cwd (the cd only takes effect in the backgrounded child).
+    #
+    # The launcher subshell's std streams are pointed at /dev/null so the
+    # backgrounded supervisor never holds our caller's stdout — otherwise
+    # `runnerctl start | …` (or any captured output) would hang until every
+    # runner exits. The runner's own output still goes to runner.log.
     local pre
     pre="$(nice_prefix)"
+    # shellcheck disable=SC2086  # $pre must word-split into the nice/ionice prefix
     (cd "$dir" && nohup $pre ./run.sh >"runner.log" 2>&1 &
-      echo $! >"$dir/runner.pid")
+      echo $! >"$dir/runner.pid") >/dev/null 2>&1 </dev/null
     echo "✓ $repo: started (pid $(cat "$dir/runner.pid" 2>/dev/null), log: $dir/runner.log)"
   done < <(find_runners)
   [ "$any" = 1 ] || echo "No runners found under $ROOT"
@@ -167,12 +176,12 @@ stop_all() {
   done < <(find_runners)
   [ "$any" = 1 ] || { echo "No runners found under $ROOT"; return; }
 
-  # Pass 2: wait for the signalled runners to actually exit, sharing one ~10s
+  # Pass 2: wait for the signalled runners to actually exit, sharing one grace
   # window across all of them (rather than reporting success the instant the
   # signal is delivered — otherwise a follow-up `start` sees a still-dying
   # process and skips it as "already running").
-  local waited=0 i still
-  while [ "$waited" -lt 100 ]; do  # up to ~10s total, not per runner
+  local waited=0 i still deadline=$((STOP_GRACE_SECS * 10))
+  while [ "$waited" -lt "$deadline" ]; do  # shared window, not per runner
     still=0
     for i in "${!dirs[@]}"; do
       [ "${state[$i]}" = signalled ] || continue
@@ -200,7 +209,7 @@ stop_all() {
   for i in "${!dirs[@]}"; do
     case "${state[$i]}" in
       stopped)      echo "✗ ${repos[$i]}: stopped" ;;
-      force-killed) echo "✗ ${repos[$i]}: force-killed (didn't stop gracefully within 10s)" ;;
+      force-killed) echo "✗ ${repos[$i]}: force-killed (didn't stop gracefully within ${STOP_GRACE_SECS}s)" ;;
     esac
   done
 }
